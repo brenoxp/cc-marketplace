@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cc-marketplace",
+  "description": "Claude Code plugin marketplace",
+  "owner": {
+    "name": "brenoxp"
+  },
+  "plugins": [
+    {
+      "name": "gai",
+      "description": "Google AI Mode search CLI (`gai`) via Playwright; existing browser or headless chromium",
+      "version": "1.0.2",
+      "author": {
+        "name": "brenoxp"
+      },
+      "source": "./plugins/gai",
+      "category": "tools"
+    }
+  ]
+}
