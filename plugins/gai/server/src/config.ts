@@ -62,7 +62,7 @@ export interface GaiConfig {
   headless: boolean;
 }
 
-const CONFIG_DIR = join(homedir(), ".claude", ".gai_mcp");
+const CONFIG_DIR = join(homedir(), ".claude", ".gai");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const DEFAULT_PROFILE_DIR = join(CONFIG_DIR, "profile");
 // Headless uses its own logged-in profile dir. Two Brave instances can't share

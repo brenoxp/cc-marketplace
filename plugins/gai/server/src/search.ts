@@ -5,7 +5,6 @@ import {
   type Page,
 } from "playwright-core";
 import type { SearchResults } from "./types.js";
-import { execFileSync } from "node:child_process";
 import {
   autoLaunchBrowser,
   getConfigDir,
@@ -49,65 +48,6 @@ function dbg(...args: unknown[]): void {
 function logFailure(...args: unknown[]): void {
   appendLog(toLine(["[fail]", ...args]));
   if (DEBUG) console.error("[gai]", ...args);
-}
-
-// Physical window frame for the automated browser: full desktop size (so
-// Google serves the desktop AI-Mode layout, small windows break the render)
-// but far off-screen so it never covers the user's screen. Applied via
-// Hammerspoon: CDP Browser.setWindowBounds is unreliable over connect.
-const OFFSCREEN_FRAME = { x: -4000, y: 0, w: 1440, h: 2200 };
-
-// Move every Brave window owned by the automation instance off-screen at the
-// desktop frame. macOS + Hammerspoon only; no-op on failure. The instance is
-// dedicated to gai, so all its windows are ours; the DevTools window (opened
-// by the CDP connection) is skipped by title. Not matched on the search title:
-// Google sets that via JS after domcontentloaded, so it isn't reliable yet.
-function moveWindowOffscreen(): void {
-  if (process.platform !== "darwin") return;
-  const { x, y, w, h } = OFFSCREEN_FRAME;
-  const lua = `local n=0 for _,win in ipairs(hs.window.allWindows()) do local a=win:application() if a and a:name():find('Brave') and not win:title():find('DevTools') then win:setFrame({x=${x},y=${y},w=${w},h=${h}}) n=n+1 end end return 'moved '..n`;
-  try {
-    const out = execFileSync("hs", ["-c", lua], {
-      encoding: "utf8",
-      timeout: 3000,
-    });
-    dbg("moveWindowOffscreen:", out.trim());
-  } catch (e) {
-    dbg("moveWindowOffscreen failed", e);
-  }
-}
-
-// Snapshot the macOS app that currently owns the keyboard, so focus can be
-// handed back after the automated browser window steals it. Returns null on
-// non-darwin or if the query fails (revert becomes a no-op).
-function captureFrontmostApp(): string | null {
-  if (process.platform !== "darwin") return null;
-  try {
-    return execFileSync(
-      "osascript",
-      [
-        "-e",
-        "tell application \"System Events\" to name of first process whose frontmost is true",
-      ],
-      { encoding: "utf8", timeout: 2000 },
-    ).trim();
-  } catch (e) {
-    dbg("captureFrontmostApp failed", e);
-    return null;
-  }
-}
-
-function restoreFrontmostApp(appName: string | null): void {
-  if (!appName) return;
-  try {
-    execFileSync(
-      "osascript",
-      ["-e", `tell application "${appName}" to activate`],
-      { encoding: "utf8", timeout: 2000 },
-    );
-  } catch (e) {
-    dbg("restoreFrontmostApp failed", e);
-  }
 }
 
 // Selectors (verified 2026-05 on udm=50 / hl=en):
@@ -236,10 +176,6 @@ export async function extractResultsMarkdown(
 
 export async function executeSearch(query: string): Promise<SearchResults> {
   const cfg = loadConfig();
-  // Capture focus before touching the browser: connecting/launching it may
-  // already raise a window. Restored after the search completes.
-  const priorFrontmost = cfg.headless ? null : captureFrontmostApp();
-
   const context = await getContext();
 
   // Inject clipboard intercept before any page scripts run. Must be on the
@@ -341,7 +277,6 @@ export async function executeSearch(query: string): Promise<SearchResults> {
       // can be cleared by hand, which also re-seeds the profile cookies.
       if (cfg.headless) {
         await page.close().catch(() => {});
-        restoreFrontmostApp(priorFrontmost);
         throw new Error(
           `Google served a "${botWall}" wall in headless mode. Rerun with a ` +
             `visible window to solve it by hand:\n` +
@@ -352,13 +287,6 @@ export async function executeSearch(query: string): Promise<SearchResults> {
       // Visible window: leave the wall up so the user can solve it in place;
       // the run continues and waits for the AI answer once it clears.
     }
-
-    // Push the window off-screen (title is now the Google Search page), then
-    // hand focus back the moment the query is in flight; the rest of the run
-    // (waiting for the answer, the Copy click) uses CDP and doesn't re-raise
-    // the window, so the user gets their app back immediately.
-    if (!cfg.headless) moveWindowOffscreen();
-    restoreFrontmostApp(priorFrontmost);
 
     dbg("waiting for response complete");
     await waitForResponseComplete(page);
@@ -390,7 +318,6 @@ export async function executeSearch(query: string): Promise<SearchResults> {
     if (!process.env.GAIS_KEEP_TAB) {
       await page.close();
     }
-    restoreFrontmostApp(priorFrontmost);
 
     return { answer: results.answer, url: results.url };
   } catch (error) {
@@ -398,7 +325,6 @@ export async function executeSearch(query: string): Promise<SearchResults> {
       `executeSearch error: ${error instanceof Error ? error.stack : String(error)}`,
     );
     await page.close().catch(() => {});
-    restoreFrontmostApp(priorFrontmost);
     throw error;
   }
 }
