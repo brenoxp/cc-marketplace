@@ -173,12 +173,13 @@ export async function extractResultsMarkdown(
     { timeout: 10000 },
   );
 
-  const copyBtn = page.locator(COPY_BUTTON_SELECTOR).first();
-  await copyBtn.scrollIntoViewIfNeeded();
-  // Element click dispatches via CDP against the logical viewport, so it works
-  // when the emulated render area is larger than the physical window (a raw
-  // mouse.click at OS coords could land outside the small window).
-  await copyBtn.click();
+  // dispatchEvent fires a synthetic DOM click straight at the button, skipping
+  // Playwright's actionability hit-test. A real .click() retries until timeout
+  // because Google layers an overlay div (class OgO3l/Zze5V) that intercepts
+  // pointer events, so the button never "receives" the click. The copy handler
+  // only needs the click event, not a physical mouse, so this is overlay-proof
+  // and viewport-independent (works in a small visible window too).
+  await page.dispatchEvent(COPY_BUTTON_SELECTOR, "click");
 
   const handle = await page.waitForFunction(
     () => (window as any).__capturedClipboard,
