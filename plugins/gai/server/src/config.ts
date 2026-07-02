@@ -64,11 +64,12 @@ export interface GaiConfig {
 
 const CONFIG_DIR = join(homedir(), ".claude", ".gai");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+// Single Brave profile shared by headless and visible launches. gai runs
+// one-shot (headless OR visible, never both at once), and launchAndWait clears
+// stale Singleton* locks before every launch, so one profile is safe. Sign in
+// once (visible) and headless reuses the same Google cookies to clear the
+// udm=50 bot-wall.
 const DEFAULT_PROFILE_DIR = join(CONFIG_DIR, "profile");
-// Headless uses its own logged-in profile dir. Two Brave instances can't share
-// one profile (Singleton lock), so headless and visible get separate dirs;
-// both must be logged into Google to clear the udm=50 bot-wall.
-const HEADLESS_PROFILE_DIR = join(CONFIG_DIR, "brave-headless-profile");
 
 const DEFAULTS: GaiConfig = {
   mode: "connect",
@@ -195,10 +196,9 @@ async function launchAndWait(
   cfg: GaiConfig,
   browserPath: string,
 ): Promise<void> {
-  // Headless auto-launch must reuse the logged-in headless profile, else it
-  // boots cookieless and hits the "unusual traffic" bot-wall. Visible mode uses
-  // the configured userDataDir (its own logged-in profile for the escape hatch).
-  const profileDir = cfg.headless ? HEADLESS_PROFILE_DIR : cfg.userDataDir;
+  // One profile for both headless and visible: the logged-in cookies seeded by
+  // a visible sign-in clear the udm=50 bot-wall on later headless runs.
+  const profileDir = cfg.userDataDir;
   if (!existsSync(profileDir)) {
     mkdirSync(profileDir, { recursive: true });
   }
