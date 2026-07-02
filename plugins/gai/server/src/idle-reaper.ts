@@ -6,23 +6,14 @@
 //
 // Usage: bun idle-reaper.ts <debugPort> <browserPgid>
 // A PID-file lock (per port) keeps a second gai run from stacking watchdogs.
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { getConfigDir } from "./config.js";
 
 const port = Number(process.argv[2]);
 const browserPgid = Number(process.argv[3]);
 if (!port || !browserPgid) process.exit(1);
 
-const DEBUG = process.env.CHROME_MCP_DEBUG === "1";
 const IDLE_MS = Number(process.env.GAI_IDLE_REAP_MS) || 5 * 60 * 1000;
 const POLL_MS = 15_000;
 const LOCK_FILE = join(tmpdir(), `gai-reaper-${port}.pid`);
@@ -141,15 +132,11 @@ function cleanupLock(): void {
   }
 }
 
-// Reaper lifecycle is verbose trace: file-logged only under DEBUG, so idle
-// warm-browser cycles leave no trace on a normal user's disk.
 function logLine(msg: string): void {
-  if (!DEBUG) return;
   try {
-    mkdirSync(getConfigDir(), { recursive: true });
-    const logFile = join(getConfigDir(), "gai-debug.log");
+    const logFile = join(homedir(), ".claude", ".gai", "gai-debug.log");
     const ts = new Date().toISOString();
-    appendFileSync(logFile, `${ts} [reaper] ${msg}\n`, { flag: "a" });
+    writeFileSync(logFile, `${ts} [reaper] ${msg}\n`, { flag: "a" });
   } catch {
     // ignore
   }
@@ -176,16 +163,44 @@ const timer = setInterval(async () => {
 
   if (Date.now() - lastActive >= IDLE_MS) {
     logLine(`idle ${IDLE_MS}ms, killing browser pgid=${browserPgid}`);
-    try {
-      process.kill(-browserPgid, "SIGTERM");
-    } catch (e) {
-      logLine(`kill failed: ${String(e)}`);
-    }
     clearInterval(timer);
+    await gracefulKillBrowser();
     cleanupLock();
     process.exit(0);
   }
 }, POLL_MS);
+
+// SIGTERM the browser's MAIN process (pgid == the detached leader's pid, which is
+// the browser's own pid) so Chromium/Brave shuts down cleanly and writes
+// exit_type:"Normal" — no "terminated improperly" nag on the next launch.
+// Signalling the whole group (-pgid) with SIGKILL is only a fallback if it will
+// not exit within the grace window.
+async function gracefulKillBrowser(): Promise<void> {
+  try {
+    process.kill(browserPgid, "SIGTERM");
+  } catch (e) {
+    logLine(`SIGTERM failed: ${String(e)}`);
+    return;
+  }
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://localhost:${port}/json/version`, {
+        signal: AbortSignal.timeout(1000),
+      });
+      if (!res.ok) return;
+    } catch {
+      return; // CDP down = browser exited cleanly
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  logLine("browser still up after grace window, force-killing group");
+  try {
+    process.kill(-browserPgid, "SIGKILL");
+  } catch (e) {
+    logLine(`SIGKILL failed: ${String(e)}`);
+  }
+}
 
 // Reap the lock if we're ever signalled.
 for (const sig of ["SIGTERM", "SIGINT"] as const) {

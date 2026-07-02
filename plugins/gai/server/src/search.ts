@@ -14,41 +14,35 @@ import {
   killRunningBrowser,
   loadConfig,
 } from "./config.js";
+import { createLogger, format, transports } from "winston";
 import { join } from "node:path";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 
 const DEBUG = process.env.CHROME_MCP_DEBUG === "1";
-const LOG_FILE = join(getConfigDir(), "gai-debug.log");
 
-function toLine(args: unknown[]): string {
+// File logger for debugging headless/browser executions. Always on, writes to
+// the gai config dir so runs can be inspected after the fact.
+const LOG_FILE = join(getConfigDir(), "gai-debug.log");
+try {
+  mkdirSync(getConfigDir(), { recursive: true });
+} catch {}
+const logger = createLogger({
+  level: "debug",
+  format: format.combine(
+    format.timestamp(),
+    format.printf(
+      ({ timestamp, level, message }) =>
+        `${timestamp} [${level}] ${message}`,
+    ),
+  ),
+  transports: [new transports.File({ filename: LOG_FILE })],
+});
+
+function dbg(...args: unknown[]) {
   const msg = args
     .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
     .join(" ");
-  return `${new Date().toISOString()} ${msg}\n`;
-}
-
-// Append to the debug log. Best-effort: never throws into the search path.
-function appendLog(line: string): void {
-  try {
-    mkdirSync(getConfigDir(), { recursive: true });
-    appendFileSync(LOG_FILE, line, { flag: "a" });
-  } catch {
-    // ignore
-  }
-}
-
-// Verbose trace. Console output and file writes happen only under DEBUG so
-// normal successful runs leave no trace on disk.
-function dbg(...args: unknown[]): void {
-  if (!DEBUG) return;
-  console.error("[gai]", ...args);
-  appendLog(toLine(args));
-}
-
-// Failure trace. Always written to the log file (even with DEBUG off) so a user
-// who hits a bot-wall or empty result has something to inspect without a rerun.
-function logFailure(...args: unknown[]): void {
-  appendLog(toLine(["[fail]", ...args]));
+  logger.debug(msg);
   if (DEBUG) console.error("[gai]", ...args);
 }
 
@@ -97,10 +91,29 @@ export async function getBrowser(): Promise<Browser> {
     }
   }
   dbg(`connecting to ${debugUrl}`);
-  cachedBrowser = await chromiumCore.connectOverCDP(debugUrl);
+  cachedBrowser = await connectWithRelaunch(cfg, debugUrl);
   cachedContext =
     cachedBrowser.contexts()[0] ?? (await cachedBrowser.newContext());
   return cachedBrowser;
+}
+
+// Connect over CDP with a short timeout, and if the browser vanished between the
+// reachability check and this connect (TOCTOU: idle-reaper or a crash killed it),
+// cold-relaunch and retry once. Without the timeout, connectOverCDP inherits
+// Playwright's 30s default and hangs on a stale ws URL when the browser is gone.
+async function connectWithRelaunch(
+  cfg: ReturnType<typeof loadConfig>,
+  debugUrl: string,
+): Promise<Browser> {
+  try {
+    return await chromiumCore.connectOverCDP(debugUrl, { timeout: 5000 });
+  } catch (e) {
+    if (!cfg.browserPath) throw e;
+    dbg(`connectOverCDP failed (${String(e)}); relaunching and retrying`);
+    await killRunningBrowser(cfg);
+    await autoLaunchBrowser(cfg);
+    return await chromiumCore.connectOverCDP(debugUrl, { timeout: 5000 });
+  }
 }
 
 async function getContext(): Promise<BrowserContext> {
@@ -297,11 +310,10 @@ export async function executeSearch(query: string): Promise<SearchResults> {
       })
       .catch(() => null);
     if (botWall) {
+      dbg(`BOT-WALL detected: ${botWall} title=${await page.title()}`);
       const shot = join(getConfigDir(), "gai-botwall.png");
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
-      logFailure(
-        `BOT-WALL detected: ${botWall} title=${await page.title()} screenshot=${shot}`,
-      );
+      dbg(`bot-wall screenshot=${shot}`);
       // Headless can't be solved by the user (no visible window). Bail with an
       // actionable message: rerun visible so the wall (login/captcha/consent)
       // can be cleared by hand, which also re-seeds the profile cookies.
@@ -336,11 +348,9 @@ export async function executeSearch(query: string): Promise<SearchResults> {
           const bodyText = await page
             .evaluate(() => document.body.innerText.slice(0, 500))
             .catch(() => "");
-          logFailure(
-            `empty result: screenshot=${shot} bodyText=${JSON.stringify(bodyText)}`,
-          );
+          dbg(`empty result: screenshot=${shot} bodyText=${JSON.stringify(bodyText)}`);
         } catch (dumpErr) {
-          logFailure(`dump failed: ${String(dumpErr)}`);
+          dbg(`dump failed: ${String(dumpErr)}`);
         }
       }
     }
@@ -358,9 +368,7 @@ export async function executeSearch(query: string): Promise<SearchResults> {
 
     return { answer: results.answer, url: results.url, authenticated };
   } catch (error) {
-    logFailure(
-      `executeSearch error: ${error instanceof Error ? error.stack : String(error)}`,
-    );
+    dbg(`executeSearch error: ${error instanceof Error ? error.stack : String(error)}`);
     await page.close().catch(() => {});
     throw error;
   }

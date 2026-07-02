@@ -18,6 +18,29 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+// Rewrite Chromium/Brave's profile Preferences so it believes the last session
+// ended cleanly, suppressing the "terminated improperly / restore pages?" nag
+// after a crash or hard kill. No-op if the file is missing or unparseable.
+function markProfileExitedCleanly(prefsPath: string): void {
+  try {
+    if (!existsSync(prefsPath)) return;
+    const prefs = JSON.parse(readFileSync(prefsPath, "utf8"));
+    if (typeof prefs !== "object" || prefs === null) return;
+    prefs.profile = prefs.profile ?? {};
+    if (
+      prefs.profile.exit_type === "Normal" &&
+      prefs.profile.exited_cleanly === true
+    ) {
+      return; // already clean, skip the write
+    }
+    prefs.profile.exit_type = "Normal";
+    prefs.profile.exited_cleanly = true;
+    writeFileSync(prefsPath, JSON.stringify(prefs), "utf8");
+  } catch {
+    // ignore: a malformed/locked Preferences file just means we skip the fix
+  }
+}
+
 // Try to atomically claim the per-port launch lock. Returns true if we own it
 // (caller must launch + release), false if a live launcher already holds it
 // (caller should wait for CDP instead of spawning a second browser). A stale
@@ -170,20 +193,35 @@ export async function getRunningHeadless(
 
 // Kill the browser (and its idle-reaper) currently bound to cfg.debugPort so a
 // relaunch in the requested mode can take over the port. Used when the running
-// mode does not match the requested one. Waits until CDP goes down (max ~5s).
+// mode does not match the requested one. Waits until CDP goes down (max ~7s).
+//
+// Sends SIGTERM (not SIGKILL) to the browser so Chromium/Brave shuts down
+// gracefully and writes exit_type:"Normal" to its profile Preferences. A hard
+// SIGKILL leaves that flag dirty and pops the "Brave was terminated improperly /
+// restore pages?" nag on the next launch. SIGKILL is only a fallback if the
+// browser refuses to exit within the grace window.
 export async function killRunningBrowser(cfg: GaiConfig): Promise<void> {
   // Kill the reaper first so it does not reap or race the relaunch, and drop its
-  // per-port pidfile lock so the fresh launch can spawn a new watchdog.
+  // per-port pidfile lock so the fresh launch can spawn a new watchdog. The
+  // reaper is a bun process with no clean-exit flag, so a hard kill is fine.
   spawnSync("pkill", ["-9", "-f", `idle-reaper.* ${cfg.debugPort}`]);
   try {
     rmSync(join(tmpdir(), `gai-reaper-${cfg.debugPort}.pid`), { force: true });
   } catch {
     // ignore
   }
-  // Kill the browser process tree bound to this debug port.
+  // Graceful stop: SIGTERM the browser bound to this debug port and give it time
+  // to flush the clean-exit flag before escalating.
+  spawnSync("pkill", ["-TERM", "-f", `remote-debugging-port=${cfg.debugPort}`]);
+  const graceDeadline = Date.now() + 5000;
+  while (Date.now() < graceDeadline) {
+    if (!(await isDebugReachable(cfg))) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  // Still up after the grace window: force it.
   spawnSync("pkill", ["-9", "-f", `remote-debugging-port=${cfg.debugPort}`]);
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
+  const hardDeadline = Date.now() + 2000;
+  while (Date.now() < hardDeadline) {
     if (!(await isDebugReachable(cfg))) return;
     await new Promise((r) => setTimeout(r, 200));
   }
@@ -252,6 +290,11 @@ async function launchAndWait(
       // ignore
     }
   }
+  // Suppress the "was terminated improperly / restore pages?" nag: if a prior
+  // instance died dirty, Chromium's Preferences still says exit_type:"Crashed".
+  // Rewrite it to "Normal" (and exited_cleanly:true) before launch. Harmless
+  // when the file is absent or the flags are already clean.
+  markProfileExitedCleanly(join(profileDir, "Default", "Preferences"));
 
   const args = [
     `--remote-debugging-port=${cfg.debugPort}`,
