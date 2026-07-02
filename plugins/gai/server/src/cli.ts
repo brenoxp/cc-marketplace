@@ -30,7 +30,9 @@ function usage() {
   console.log(`Usage: gai [-t text|md|json] [-v] <query>
 
 Options:
-  -t <fmt>    Output format: text (default), md (markdown via copy button, piped through glow), or json
+  -t <fmt>    Output format: text, md (rendered via glow), or json.
+              Default: md in a terminal when glow is installed, else text;
+              json when piped.
   -v          Open results in Hammerspoon md_viewer
   -k          Keep Google AI tab open (don't close after search)
   --id <hash> Replay a saved request by id (no browser, served from disk)
@@ -84,6 +86,16 @@ function pipeToGlow(content: string): void {
   execSync("glow", { input: content, stdio: ["pipe", "inherit", "inherit"] });
 }
 
+// glow present on PATH? Cached across the single process lifetime.
+function hasGlow(): boolean {
+  try {
+    execSync("command -v glow", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 
 const args = process.argv.slice(2);
 if (args.includes("-h") || args.includes("--help")) usage();
@@ -108,6 +120,13 @@ for (let i = 0; i < args.length; i++) {
   } else {
     queryParts.push(args[i]);
   }
+}
+
+// Interactive terminal + glow installed + no explicit -t → default to md (glow
+// render). Piped output still emits JSON (handled in emit); this only upgrades
+// the human-facing default from plain text to rendered markdown.
+if (!fmtExplicit && process.stdout.isTTY && hasGlow()) {
+  fmt = "md";
 }
 
 // Render a request under the requested output format. The cache holds the raw
