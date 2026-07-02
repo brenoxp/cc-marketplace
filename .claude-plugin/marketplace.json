@@ -9,7 +9,7 @@
     {
       "name": "gai",
       "description": "Google AI Mode search CLI (`gai`) via Playwright; existing browser or headless chromium",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "author": {
         "name": "brenoxp"
       },

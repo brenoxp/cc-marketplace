@@ -53,6 +53,11 @@ function dbg(...args: unknown[]) {
 const AI_ANSWER_SELECTOR = 'div[jsname="KFl8ub"]';
 const COPY_BUTTON_SELECTOR = 'button[aria-label="Copy text"]';
 
+// Permanent failures the retry loop must never re-run: a Google wall (only a
+// human can clear it) and an unconfigured browser. Tagged so executeSearch's
+// classifier can distinguish them from a transient crash.
+class PermanentSearchError extends Error {}
+
 let cachedBrowser: Browser | null = null;
 let cachedContext: BrowserContext | null = null;
 
@@ -68,7 +73,7 @@ export async function getBrowser(): Promise<Browser> {
       dbg(`CDP down, auto-launching ${cfg.browserPath}`);
       await autoLaunchBrowser(cfg);
     } else {
-      throw new Error(
+      throw new PermanentSearchError(
         `Cannot reach Chrome debug at ${debugUrl} and no browserPath configured. ` +
           `Run /gai:config-gai or start the browser with --remote-debugging-port=${cfg.debugPort}.`,
       );
@@ -116,12 +121,36 @@ async function connectWithRelaunch(
   }
 }
 
+// A warm browser can die between runs (idle-reaper race, crash, OS kill) while
+// the cached handle looks fine, or the browser stays up but its context/page got
+// orphaned by a renderer crash. Both surface later as "Target/context/browser has
+// been closed" mid-search. Validate the cache before reuse and drop it if stale so
+// getBrowser cold-relaunches instead of handing back a dead handle.
 async function getContext(): Promise<BrowserContext> {
+  if (cachedContext) {
+    const browser = cachedContext.browser();
+    const alive = browser?.isConnected() ?? false;
+    if (!alive) {
+      dbg("cached context stale (browser disconnected); clearing");
+      clearBrowser();
+    }
+  }
   await getBrowser();
   if (!cachedContext) {
     throw new Error("Browser context not initialized");
   }
   return cachedContext;
+}
+
+// Errors worth retrying with a fresh browser: the browser/page/context vanished
+// mid-flight (crash, idle-reap, disconnect). Walls, auth, and config errors are
+// permanent for this run and must NOT be retried (a bot-wall retry burns another
+// full 76s poll for nothing).
+function isTransientError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /Target (page|context|browser).*closed|Browser.*closed|context.*closed|has been closed|disconnected|websocket|WebSocket|CDP|Protocol error|crashed|Connection closed|browserContext|Execution context was destroyed|Navigation failed|net::ERR/i.test(
+    msg,
+  );
 }
 
 export function clearBrowser(): void {
@@ -217,7 +246,9 @@ async function isAuthenticated(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
-export async function executeSearch(query: string): Promise<SearchResults> {
+// Single search attempt. May throw transient (crash/disconnect) or permanent
+// (PermanentSearchError: wall/config) errors; executeSearch wraps this with retry.
+async function executeSearchOnce(query: string): Promise<SearchResults> {
   const cfg = loadConfig();
   const context = await getContext();
 
@@ -319,7 +350,7 @@ export async function executeSearch(query: string): Promise<SearchResults> {
       // can be cleared by hand, which also re-seeds the profile cookies.
       if (cfg.headless) {
         await page.close().catch(() => {});
-        throw new Error(
+        throw new PermanentSearchError(
           `Google served a "${botWall}" wall in headless mode. Rerun with a ` +
             `visible window to solve it by hand:\n` +
             `  GAI_HEADLESS=false gai "<query>"\n` +
@@ -368,8 +399,64 @@ export async function executeSearch(query: string): Promise<SearchResults> {
 
     return { answer: results.answer, url: results.url, authenticated };
   } catch (error) {
-    dbg(`executeSearch error: ${error instanceof Error ? error.stack : String(error)}`);
+    dbg(`executeSearchOnce error: ${error instanceof Error ? error.stack : String(error)}`);
     await page.close().catch(() => {});
     throw error;
   }
+}
+
+// Public entry point. Runs the search with bounded retries so a warm-browser
+// crash, an orphaned context, or a not-yet-settled DOM (empty answer) recovers
+// automatically instead of surfacing the flaky one-shot failures customers hit.
+//
+// Retries (up to MAX_ATTEMPTS total) on:
+//   - transient errors (browser/page/context vanished) -> drop the stale cache
+//     so the next attempt cold-relaunches a fresh browser
+//   - an empty answer (DOM missed / not settled) -> retry once with a fresh page
+// Never retries PermanentSearchError (bot-wall / no browser configured): those
+// need a human, and re-running a wall burns another full poll for nothing.
+export async function executeSearch(query: string): Promise<SearchResults> {
+  const MAX_ATTEMPTS = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const results = await executeSearchOnce(query);
+
+      // Empty answer is a soft failure: the page loaded but no answer text was
+      // captured (selector missed / stream not committed). Retry with a fresh
+      // page; on the final attempt return whatever we have rather than throwing.
+      if (results.answer.length === 0 && attempt < MAX_ATTEMPTS) {
+        dbg(`empty answer on attempt ${attempt}/${MAX_ATTEMPTS}; retrying`);
+        clearBrowser();
+        continue;
+      }
+      if (attempt > 1) dbg(`search recovered on attempt ${attempt}/${MAX_ATTEMPTS}`);
+      return results;
+    } catch (error) {
+      lastError = error;
+
+      if (error instanceof PermanentSearchError) {
+        dbg("permanent error; not retrying");
+        throw error;
+      }
+      if (!isTransientError(error) || attempt >= MAX_ATTEMPTS) {
+        dbg(
+          `giving up after attempt ${attempt}/${MAX_ATTEMPTS}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        break;
+      }
+      dbg(
+        `transient error on attempt ${attempt}/${MAX_ATTEMPTS} (${
+          error instanceof Error ? error.message : String(error)
+        }); dropping cache and retrying`,
+      );
+      // Force a cold relaunch on the next attempt: the warm handle is dead.
+      clearBrowser();
+    }
+  }
+
+  throw lastError;
 }
