@@ -9,7 +9,9 @@ import {
   autoLaunchBrowser,
   getConfigDir,
   getDebugUrl,
+  getRunningHeadless,
   isDebugReachable,
+  killRunningBrowser,
   loadConfig,
 } from "./config.js";
 import { join } from "node:path";
@@ -76,6 +78,22 @@ export async function getBrowser(): Promise<Browser> {
         `Cannot reach Chrome debug at ${debugUrl} and no browserPath configured. ` +
           `Run /gai:config-gai or start the browser with --remote-debugging-port=${cfg.debugPort}.`,
       );
+    }
+  } else {
+    // A browser is already on the port. If its mode differs from the requested
+    // one (e.g. a warm headless instance when GAI_HEADLESS=false asks for a
+    // visible window to sign in), kill it and relaunch in the requested mode.
+    const runningHeadless = await getRunningHeadless(cfg);
+    if (
+      runningHeadless !== null &&
+      runningHeadless !== cfg.headless &&
+      cfg.browserPath
+    ) {
+      dbg(
+        `mode mismatch: running headless=${runningHeadless}, requested headless=${cfg.headless}; relaunching`,
+      );
+      await killRunningBrowser(cfg);
+      await autoLaunchBrowser(cfg);
     }
   }
   dbg(`connecting to ${debugUrl}`);

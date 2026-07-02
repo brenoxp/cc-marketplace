@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -145,6 +145,47 @@ export async function isDebugReachable(cfg: GaiConfig): Promise<boolean> {
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+// Probe the running browser's mode via CDP /json/version. A headless Chrome/Brave
+// advertises "HeadlessChrome" in its User-Agent; a visible one reports plain
+// "Chrome". Returns the running headless boolean, or null if unreachable/unknown.
+export async function getRunningHeadless(
+  cfg: GaiConfig,
+): Promise<boolean | null> {
+  try {
+    const res = await fetch(`${getDebugUrl(cfg)}/json/version`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return null;
+    const info = (await res.json()) as { "User-Agent"?: string };
+    const ua = info["User-Agent"];
+    if (typeof ua !== "string") return null;
+    return /headless/i.test(ua);
+  } catch {
+    return null;
+  }
+}
+
+// Kill the browser (and its idle-reaper) currently bound to cfg.debugPort so a
+// relaunch in the requested mode can take over the port. Used when the running
+// mode does not match the requested one. Waits until CDP goes down (max ~5s).
+export async function killRunningBrowser(cfg: GaiConfig): Promise<void> {
+  // Kill the reaper first so it does not reap or race the relaunch, and drop its
+  // per-port pidfile lock so the fresh launch can spawn a new watchdog.
+  spawnSync("pkill", ["-9", "-f", `idle-reaper.* ${cfg.debugPort}`]);
+  try {
+    rmSync(join(tmpdir(), `gai-reaper-${cfg.debugPort}.pid`), { force: true });
+  } catch {
+    // ignore
+  }
+  // Kill the browser process tree bound to this debug port.
+  spawnSync("pkill", ["-9", "-f", `remote-debugging-port=${cfg.debugPort}`]);
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (!(await isDebugReachable(cfg))) return;
+    await new Promise((r) => setTimeout(r, 200));
   }
 }
 
