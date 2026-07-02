@@ -11,11 +11,27 @@ import { execSync } from "child_process";
 
 type OutputFormat = "md" | "text" | "json";
 
+function openInMdViewer(markdown: string, query: string): void {
+  const tmpDir = process.env.TMPDIR || "/tmp";
+  const slug = query
+    .split("\n")[0]
+    .slice(0, 50)
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/-+$/, "");
+  const tmpFile = `${tmpDir}/gais-${slug}.md`;
+  const { writeFileSync } = require("fs");
+  writeFileSync(tmpFile, markdown, "utf-8");
+  execSync(`hs -c "require('modules.md_viewer').open('${tmpFile}')"`, {
+    stdio: "ignore",
+  });
+}
+
 function usage() {
-  console.log(`Usage: gai [-t text|md|json] <query>
+  console.log(`Usage: gai [-t text|md|json] [-v] <query>
 
 Options:
-  -t <fmt>    Output format: text (default), md (markdown rendered via glow if installed), or json
+  -t <fmt>    Output format: text (default), md (markdown via copy button, piped through glow), or json
+  -v          Open results in Hammerspoon md_viewer
   -k          Keep Google AI tab open (don't close after search)
   --id <hash> Replay a saved request by id (no browser, served from disk)
   -h          Show this help
@@ -64,14 +80,8 @@ function stripReferences(markdown: string): string {
   return out.trim();
 }
 
-// Render markdown through `glow` if it's installed; otherwise print raw
-// markdown so the CLI still works on machines without glow.
 function pipeToGlow(content: string): void {
-  try {
-    execSync("glow", { input: content, stdio: ["pipe", "inherit", "inherit"] });
-  } catch {
-    console.log(content);
-  }
+  execSync("glow", { input: content, stdio: ["pipe", "inherit", "inherit"] });
 }
 
 
@@ -81,6 +91,7 @@ if (args.length === 0 && process.stdin.isTTY) usage();
 
 let fmt: OutputFormat = "text";
 let fmtExplicit = false;
+let viewInMdViewer = false;
 let replayId = "";
 const queryParts: string[] = [];
 
@@ -92,6 +103,8 @@ for (let i = 0; i < args.length; i++) {
     replayId = args[++i];
   } else if (args[i] === "-k") {
     process.env.GAIS_KEEP_TAB = "1";
+  } else if (args[i] === "-v") {
+    viewInMdViewer = true;
   } else {
     queryParts.push(args[i]);
   }
@@ -99,18 +112,24 @@ for (let i = 0; i < args.length; i++) {
 
 // Render a request under the requested output format. The cache holds the raw
 // markdown capture, so any format (including a different -t on --id replay)
-// derives from the same source.
+// derives from the same source. References are stripped everywhere except the
+// md_viewer, where the source links stay clickable.
 function emit(
   req: CachedRequest,
   fmt: OutputFormat,
   fmtExplicit: boolean,
+  viewInMdViewer: boolean,
 ): void {
-  const { query, id, answer: raw } = req;
+  const { query, url, id, answer: raw } = req;
   const clean = stripReferences(raw);
   const piped = !process.stdout.isTTY;
 
   if (fmt === "json" || (piped && !fmtExplicit)) {
     console.log(JSON.stringify({ query, answer: clean, id }, null, 2));
+  } else if (viewInMdViewer) {
+    const withUrl = url ? `[Source](${url})\n\n---\n\n${raw}` : raw;
+    openInMdViewer(withUrl, query);
+    console.log(`[id: ${id}]`);
   } else if (fmt === "md" && !piped) {
     pipeToGlow(clean);
     console.log(`\n[id: ${id}]`);
@@ -128,7 +147,7 @@ if (replayId) {
     console.error(`Error: no saved request with id "${replayId}"`);
     process.exit(1);
   }
-  emit(cached, fmt, fmtExplicit);
+  emit(cached, fmt, fmtExplicit, viewInMdViewer);
   process.exit(0);
 }
 
@@ -153,22 +172,16 @@ const query = stdinContent
   : queryText;
 
 try {
-  const result = await executeSearch(query);
-  const text = result.content[0];
-  if (text && text.type === "text") {
-    const parsed = JSON.parse(text.text);
-    const answer: string = parsed.answer;
-    const url: string = parsed.url ?? "";
-    const req: CachedRequest = {
-      id: makeRequestId(query, answer),
-      query,
-      answer,
-      url,
-      timestamp: new Date().toISOString(),
-    };
-    saveRequest(req);
-    emit(req, fmt, fmtExplicit);
-  }
+  const { answer, url } = await executeSearch(query);
+  const req: CachedRequest = {
+    id: makeRequestId(query, answer),
+    query,
+    answer,
+    url: url ?? "",
+    timestamp: new Date().toISOString(),
+  };
+  saveRequest(req);
+  emit(req, fmt, fmtExplicit, viewInMdViewer);
 } catch (e) {
   console.error(`Error: ${(e as Error).message}`);
   process.exit(1);

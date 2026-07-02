@@ -9,8 +9,3 @@ export interface SearchResults {
   answer: string;
   url: string;
 }
-
-// Minimal MCP-style result envelope. The CLI parses content[0].text as JSON.
-export interface ToolResult {
-  content: Array<{ type: "text"; text: string }>;
-}
