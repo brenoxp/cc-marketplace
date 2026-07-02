@@ -59,22 +59,71 @@ function isAlive(pid: number): boolean {
   }
 }
 
-// Count non-blank page targets. A gai search opens a real tab then closes it,
-// so "no real pages" means the browser is idle.
+// This is a gai-dedicated browser, so any non-blank page is a gai search tab.
+// A healthy search opens a tab, gets its answer in ~5s, and self-closes (search.ts
+// page.close()). A tab that survives a full poll cycle (POLL_MS, 15s >> 5s) is an
+// ORPHAN: left behind when a gai run was SIGTERM-killed mid-search (timeout, ^C)
+// before its page.close() ran. Orphans used to be counted as activity, which reset
+// the idle timer forever and made the browser immortal. Now we CLOSE any real page
+// that was already present on the previous poll (proven orphan) and count only
+// pages seen for the first time (possible in-flight search) as active.
+let prevOrphanIds = new Set<string>();
+
+function isRealPage(t: { type: string; url: string }): boolean {
+  return (
+    t.type === "page" &&
+    t.url !== "about:blank" &&
+    !t.url.startsWith("devtools://") &&
+    !t.url.startsWith("chrome://")
+  );
+}
+
+async function closeTarget(id: string): Promise<void> {
+  try {
+    await fetch(`http://localhost:${port}/json/close/${id}`, {
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch {
+    // best effort; next poll retries
+  }
+}
+
+// Returns count of pages treated as ACTIVE (in-flight searches), or null if the
+// port is unreachable. Side effect: closes orphaned tabs seen two polls running.
 async function activePages(): Promise<number | null> {
   try {
     const res = await fetch(`http://localhost:${port}/json`, {
       signal: AbortSignal.timeout(2000),
     });
     if (!res.ok) return null;
-    const targets = (await res.json()) as Array<{ type: string; url: string }>;
-    return targets.filter(
-      (t) =>
-        t.type === "page" &&
-        t.url !== "about:blank" &&
-        !t.url.startsWith("devtools://") &&
-        !t.url.startsWith("chrome://"),
-    ).length;
+    const targets = (await res.json()) as Array<{
+      id: string;
+      type: string;
+      url: string;
+    }>;
+    const real = targets.filter(isRealPage);
+    const seenLastPoll = prevOrphanIds; // ids present on the previous poll
+
+    // A real page present on this poll AND the previous one is a proven orphan
+    // (a live search would have finished and self-closed within one poll). Close
+    // it and don't count it. A page seen for the FIRST time may be an in-flight
+    // search, so it counts as active this round.
+    let closed = 0;
+    let active = 0;
+    for (const t of real) {
+      if (seenLastPoll.has(t.id)) {
+        await closeTarget(t.id);
+        closed++;
+      } else {
+        active++;
+      }
+    }
+    if (closed > 0) logLine(`closed ${closed} orphan tab(s)`);
+
+    // Carry this poll's ids forward: a tab still here next poll is an orphan.
+    prevOrphanIds = new Set(real.map((t) => t.id));
+
+    return active;
   } catch {
     return null; // port unreachable
   }
