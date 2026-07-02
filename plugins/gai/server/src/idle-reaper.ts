@@ -27,12 +27,28 @@ const IDLE_MS = Number(process.env.GAI_IDLE_REAP_MS) || 5 * 60 * 1000;
 const POLL_MS = 15_000;
 const LOCK_FILE = join(tmpdir(), `gai-reaper-${port}.pid`);
 
-// Single-watchdog lock: if a live reaper already owns this port, exit.
+// Single-watchdog lock, per port. Lock holds "pid:pgid": the live reaper's PID
+// and the browser pgid it watches. On startup:
+//   - owner alive AND watching the SAME browser pgid -> real duplicate, exit.
+//   - owner alive but watching a DIFFERENT (stale) pgid -> it points at a dead
+//     browser and would never reap the current one; kill it and steal the lock.
+//   - owner dead / lock garbage -> steal.
 if (existsSync(LOCK_FILE)) {
-  const owner = Number(readFileSync(LOCK_FILE, "utf8").trim());
-  if (owner && isAlive(owner)) process.exit(0);
+  const [ownerRaw, ownerPgidRaw] = readFileSync(LOCK_FILE, "utf8")
+    .trim()
+    .split(":");
+  const owner = Number(ownerRaw);
+  const ownerPgid = Number(ownerPgidRaw);
+  if (owner && isAlive(owner)) {
+    if (ownerPgid === browserPgid) process.exit(0); // true duplicate
+    try {
+      process.kill(owner, "SIGTERM"); // stale reaper on a dead browser
+    } catch {
+      // already gone
+    }
+  }
 }
-writeFileSync(LOCK_FILE, String(process.pid), "utf8");
+writeFileSync(LOCK_FILE, `${process.pid}:${browserPgid}`, "utf8");
 
 function isAlive(pid: number): boolean {
   try {
@@ -64,11 +80,15 @@ async function activePages(): Promise<number | null> {
   }
 }
 
+// Remove the lock only if WE still own it. A stale reaper being SIGTERM-stolen
+// must not delete the new owner's freshly written lock (that would let a later
+// duplicate stack). Compare the pid field, ignore the pgid.
 function cleanupLock(): void {
   try {
-    rmSync(LOCK_FILE, { force: true });
+    const owner = Number(readFileSync(LOCK_FILE, "utf8").trim().split(":")[0]);
+    if (owner === process.pid) rmSync(LOCK_FILE, { force: true });
   } catch {
-    // ignore
+    // no lock / unreadable: nothing to clean
   }
 }
 
