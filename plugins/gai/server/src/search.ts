@@ -174,6 +174,17 @@ export async function extractResultsMarkdown(
   return { answer, url: page.url() };
 }
 
+// Probe whether the AI Mode page is served to a signed-in Google account. The
+// signed-in surface renders an account menu whose anchor points at
+// SignOutOptions; the signed-out surface shows a ServiceLogin "Sign in" link
+// instead. Anonymous traffic still gets AI answers, but signed-in sessions get
+// better personalization and log to My Activity, so we surface a soft warning.
+async function isAuthenticated(page: Page): Promise<boolean> {
+  return await page
+    .evaluate(() => !!document.querySelector('a[href*="SignOutOptions"]'))
+    .catch(() => false);
+}
+
 export async function executeSearch(query: string): Promise<SearchResults> {
   const cfg = loadConfig();
   const context = await getContext();
@@ -315,11 +326,18 @@ export async function executeSearch(query: string): Promise<SearchResults> {
       }
     }
 
+    // Probe auth on the same loaded page (no extra navigation). Only meaningful
+    // once an answer rendered; skip it on empty results to avoid a false signal
+    // from a wall/error page.
+    const authenticated =
+      results.answer.length > 0 ? await isAuthenticated(page) : undefined;
+    dbg(`authenticated=${authenticated}`);
+
     if (!process.env.GAIS_KEEP_TAB) {
       await page.close();
     }
 
-    return { answer: results.answer, url: results.url };
+    return { answer: results.answer, url: results.url, authenticated };
   } catch (error) {
     logFailure(
       `executeSearch error: ${error instanceof Error ? error.stack : String(error)}`,

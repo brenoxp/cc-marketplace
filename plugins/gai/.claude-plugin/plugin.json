@@ -1,7 +1,7 @@
 {
   "name": "gai",
   "description": "Google AI Mode search CLI (`gai`) via Playwright; configurable to use an existing browser or headless chromium.",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": {
     "name": "brenoxp"
   }

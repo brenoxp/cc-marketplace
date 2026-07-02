@@ -119,14 +119,26 @@ function emit(
   fmt: OutputFormat,
   fmtExplicit: boolean,
   viewInMdViewer: boolean,
+  warning?: string,
 ): void {
   const { query, url, id, answer: raw } = req;
   const clean = stripReferences(raw);
   const piped = !process.stdout.isTTY;
 
   if (fmt === "json" || (piped && !fmtExplicit)) {
-    console.log(JSON.stringify({ query, answer: clean, id }, null, 2));
-  } else if (viewInMdViewer) {
+    // Carry the warning IN the JSON so programmatic callers (who never see
+    // stderr) can surface it; omitted entirely when there's nothing to warn.
+    console.log(
+      JSON.stringify(
+        warning ? { query, answer: clean, id, warning } : { query, answer: clean, id },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  if (viewInMdViewer) {
     const withUrl = url ? `[Source](${url})\n\n---\n\n${raw}` : raw;
     openInMdViewer(withUrl, query);
     console.log(`[id: ${id}]`);
@@ -138,6 +150,9 @@ function emit(
     console.log(clean);
     console.log(`\n[id: ${id}]`);
   }
+  // Human-facing formats: the warning goes to stderr so it never mixes into the
+  // answer text a downstream pipe might capture.
+  if (warning) console.error(`\n[gai] ${warning}`);
 }
 
 // Replay path: serve a saved request from disk under the live flags, no browser.
@@ -172,7 +187,7 @@ const query = stdinContent
   : queryText;
 
 try {
-  const { answer, url } = await executeSearch(query);
+  const { answer, url, authenticated } = await executeSearch(query);
   const req: CachedRequest = {
     id: makeRequestId(query, answer),
     query,
@@ -181,7 +196,15 @@ try {
     timestamp: new Date().toISOString(),
   };
   saveRequest(req);
-  emit(req, fmt, fmtExplicit, viewInMdViewer);
+  // Anonymous traffic still gets answers, but a signed-in session gives better
+  // responses and logs to Google My Activity. Warn only when the page positively
+  // showed signed-out; the warning rides in the JSON (for programmatic callers)
+  // and on stderr (for humans) via emit().
+  const warning =
+    authenticated === false
+      ? 'Not signed in to Google. Answers work anonymously, but sign in for better responses and search history: run `GAI_HEADLESS=false gai "<query>"`, sign in once in the window, then close it.'
+      : undefined;
+  emit(req, fmt, fmtExplicit, viewInMdViewer, warning);
 } catch (e) {
   console.error(`Error: ${(e as Error).message}`);
   process.exit(1);

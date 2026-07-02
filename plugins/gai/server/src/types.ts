@@ -8,4 +8,7 @@ export interface SearchArgs {
 export interface SearchResults {
   answer: string;
   url: string;
+  // undefined when auth state wasn't probed (e.g. the answer failed to render);
+  // false only when the AI Mode page positively showed a signed-out surface.
+  authenticated?: boolean;
 }
