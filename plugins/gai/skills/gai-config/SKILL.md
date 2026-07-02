@@ -92,7 +92,7 @@ Spawn the browser detached with the debug flag and the persistent profile, then 
 disown
 ```
 Poll `curl -s http://localhost:$PORT/json/version` for a few seconds.
-- If it responds: validation passed. Tell the user the browser started. Then offer (AskUserQuestion) to log into Google in the opened window now so the persistent profile avoids captchas later (recommended). That login persists across reboots since the profile lives under `~/.claude/`.
+- If it responds: validation passed. Tell the user the browser started. Then offer (AskUserQuestion) to log into Google in the opened window now so the persistent profile avoids captchas later (recommended). That login persists across reboots since the profile lives under `~/.claude/`. The single profile is shared by headless and visible launches, so this one-time sign-in seeds cookies that later headless runs reuse (clearing the AI-Mode bot-wall and silencing the signed-out warning). To sign in again later at any time: `GAI_HEADLESS=false gai "test"` opens a visible window — gai detects a warm headless instance is the wrong mode, kills it, and relaunches visible so the window actually appears; sign in, then close it.
 - If it never responds: validation FAILED. Show the error, and offer to re-pick the browser, switch to mode B, or re-run setup. Do not proceed to Step 7 with a browser that won't start.
 
 ### Mode B
@@ -149,6 +149,6 @@ Run a live search to confirm the browser path works:
 gai "what year is it"
 ```
 
-A working setup prints JSON with an `answer` field. If it fails, show the error and offer to switch modes or re-run setup.
+A working setup prints JSON with an `answer` field. A `warning` field about not being signed in is non-fatal (answers still work anonymously) — clear it with the `GAI_HEADLESS=false gai "..."` sign-in from step 6. If the search fails outright, show the error and offer to switch modes or re-run setup.
 
 To undo any of this later, run `/gai:gai-remove`.
